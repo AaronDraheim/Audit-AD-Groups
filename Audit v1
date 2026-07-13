@@ -1,0 +1,309 @@
+<#Disclaimer
+The sample scripts are not supported under any Microsoft standard support program or service.
+The sample scripts are provided AS IS without warranty of any kind. Microsoft further disclaims all implied warranties
+including, without limitation, any implied warranties of merchantability or of fitness for a particular purpose.
+The entire risk arising out of the use or performance of the sample scripts and documentation remains with you.
+In no event shall Microsoft, its authors, or anyone else involved in the creation, production, or delivery of the scripts
+be liable for any damages whatsoever (including, without limitation, damages for loss of business profits, business interruption,
+loss of business information, or other pecuniary loss) arising out of the use of or inability to use the sample scripts or
+documentation, even if Microsoft has been advised of the possibility of such damages.#>
+
+
+
+<#
+.SYNOPSIS
+    Active Directory change review script with Tier-0 reporting, zero-change reporting, combined overview, and CSV exports.
+
+.DESCRIPTION
+    Queries domain controller security logs for the same event IDs used by the original script, summarizes adds/removes/changes, exports CSV reports, and provides an interactive menu.
+#>
+
+[CmdletBinding()]
+param(
+    [string]$OutputPath = (Join-Path -Path (Get-Location) -ChildPath "AD-ChangeReports"),
+    [int]$DaysBack = 30,
+    [int]$TopCount = 25,
+    [string[]]$DomainControllers = @()
+)
+
+Set-StrictMode -Version 2.0
+$ErrorActionPreference = 'Stop'
+
+# Preserve the original reporting purpose and event coverage.
+$Script:EventIds = @(
+    4720, 4722, 4723, 4724, 4725, 4726, 4738, 4740, 4767,
+    4727, 4728, 4729, 4730, 4731, 4732, 4733, 4734, 4735,
+    4737, 4754, 4755, 4756, 4757, 4758, 4764, 5136, 5137,
+    5138, 5139, 5141
+)
+
+$Script:Tier0Names = @(
+    'Administrators', 'Domain Admins', 'Enterprise Admins', 'Schema Admins',
+    'Account Operators', 'Backup Operators', 'Server Operators', 'Print Operators',
+    'DnsAdmins', 'Group Policy Creator Owners', 'Enterprise Key Admins', 'Key Admins'
+)
+
+function Initialize-ReportFolder {
+    param([string]$Path)
+    if (-not (Test-Path -LiteralPath $Path)) {
+        New-Item -Path $Path -ItemType Directory -Force | Out-Null
+    }
+}
+
+function Test-IsLocalComputer {
+    param([string]$ComputerName)
+
+    if ([string]::IsNullOrWhiteSpace($ComputerName)) { return $true }
+
+    $target = $ComputerName.Trim()
+    $localNames = @(
+        '.',
+        'localhost',
+        $env:COMPUTERNAME,
+        "$env:COMPUTERNAME.$env:USERDNSDOMAIN"
+    ) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+
+    return ($localNames | ForEach-Object { $_.ToLowerInvariant() }) -contains $target.ToLowerInvariant()
+}
+
+function Get-TargetDomainControllers {
+    if ($DomainControllers -and $DomainControllers.Count -gt 0) {
+        return $DomainControllers
+    }
+
+    try {
+        Import-Module ActiveDirectory -ErrorAction Stop
+        return (Get-ADDomainController -Filter * | Select-Object -ExpandProperty HostName)
+    }
+    catch {
+        Write-Warning "ActiveDirectory module/domain controller discovery failed. Using local computer. $($_.Exception.Message)"
+        return @($env:COMPUTERNAME)
+    }
+}
+
+function Get-DirectoryChangeEvents {
+    param(
+        [string[]]$ComputerName,
+        [datetime]$StartTime = (Get-Date).AddDays(-$DaysBack),
+        [int[]]$EventId = $Script:EventIds
+    )
+
+    $events = New-Object System.Collections.Generic.List[object]
+
+    foreach ($computer in $ComputerName) {
+        Write-Host "Querying Security log on $computer ..." -ForegroundColor Cyan
+        $filter = @{
+            LogName   = 'Security'
+            Id        = $EventId
+            StartTime = $StartTime
+        }
+
+        try {
+            if (Test-IsLocalComputer -ComputerName $computer) {
+                $rawEvents = Get-WinEvent -FilterHashtable $filter -ErrorAction Stop
+            }
+            else {
+                $rawEvents = Get-WinEvent -ComputerName $computer -FilterHashtable $filter -ErrorAction Stop
+            }
+
+            foreach ($event in $rawEvents) {
+                $xml = [xml]$event.ToXml()
+                $data = @{}
+                foreach ($node in $xml.Event.EventData.Data) {
+                    if ($node.Name) { $data[$node.Name] = [string]$node.'#text' }
+                }
+
+                $targetName = $data['TargetUserName']
+                if ([string]::IsNullOrWhiteSpace($targetName)) { $targetName = $data['TargetAccount'] }
+                if ([string]::IsNullOrWhiteSpace($targetName)) { $targetName = $data['ObjectName'] }
+                if ([string]::IsNullOrWhiteSpace($targetName)) { $targetName = $data['MemberName'] }
+
+                $actor = $data['SubjectUserName']
+                if ([string]::IsNullOrWhiteSpace($actor)) { $actor = $data['UserName'] }
+
+                $action = switch ($event.Id) {
+                    4720 { 'User Created' }
+                    4722 { 'User Enabled' }
+                    4723 { 'Password Change Attempt' }
+                    4724 { 'Password Reset' }
+                    4725 { 'User Disabled' }
+                    4726 { 'User Deleted' }
+                    4738 { 'User Changed' }
+                    4740 { 'User Locked Out' }
+                    4767 { 'User Unlocked' }
+                    4727 { 'Global Group Created' }
+                    4728 { 'Member Added To Global Group' }
+                    4729 { 'Member Removed From Global Group' }
+                    4730 { 'Global Group Deleted' }
+                    4731 { 'Local Group Created' }
+                    4732 { 'Member Added To Local Group' }
+                    4733 { 'Member Removed From Local Group' }
+                    4734 { 'Local Group Deleted' }
+                    4735 { 'Local Group Changed' }
+                    4737 { 'Global Group Changed' }
+                    4754 { 'Universal Group Created' }
+                    4755 { 'Universal Group Changed' }
+                    4756 { 'Member Added To Universal Group' }
+                    4757 { 'Member Removed From Universal Group' }
+                    4758 { 'Universal Group Deleted' }
+                    4764 { 'Group Type Changed' }
+                    5136 { 'Directory Object Modified' }
+                    5137 { 'Directory Object Created' }
+                    5138 { 'Directory Object Undeleted' }
+                    5139 { 'Directory Object Moved' }
+                    5141 { 'Directory Object Deleted' }
+                    default { 'Directory Change' }
+                }
+
+                $changeType = if ($event.Id -in 4728,4732,4756,4720,4722,5137,5138) { 'Add' }
+                              elseif ($event.Id -in 4729,4733,4757,4725,4726,5141) { 'Remove' }
+                              else { 'Change' }
+
+                $events.Add([pscustomobject]@{
+                    TimeCreated  = $event.TimeCreated
+                    ComputerName = $computer
+                    EventId      = $event.Id
+                    Action       = $action
+                    ChangeType   = $changeType
+                    Target       = $targetName
+                    Actor        = $actor
+                    Message      = $event.Message
+                })
+            }
+        }
+        catch {
+            Write-Warning "Failed to query $computer. $($_.Exception.Message)"
+        }
+    }
+
+    return $events | Sort-Object TimeCreated -Descending
+}
+
+function Get-ChangeSummary {
+    param([object[]]$Events)
+
+    $Events |
+        Group-Object -Property Target |
+        ForEach-Object {
+            $groupEvents = $_.Group
+            [pscustomobject]@{
+                GroupKey         = $_.Name
+                TotalChanges     = $groupEvents.Count
+                Adds             = @($groupEvents | Where-Object { $_.ChangeType -eq 'Add' }).Count
+                Removes          = @($groupEvents | Where-Object { $_.ChangeType -eq 'Remove' }).Count
+                FirstSeen        = ($groupEvents | Sort-Object TimeCreated | Select-Object -First 1).TimeCreated
+                LastSeen         = ($groupEvents | Sort-Object TimeCreated -Descending | Select-Object -First 1).TimeCreated
+                UniqueActorCount = @($groupEvents | Where-Object { $_.Actor } | Select-Object -ExpandProperty Actor -Unique).Count
+            }
+        } |
+        Sort-Object TotalChanges -Descending
+}
+
+function Get-Tier0Results {
+    param([object[]]$Events)
+
+    $Events |
+        Where-Object {
+            $target = [string]$_.Target
+            $message = [string]$_.Message
+            ($Script:Tier0Names | Where-Object { $target -like "*$_*" -or $message -like "*$_*" }).Count -gt 0
+        } |
+        Sort-Object TimeCreated -Descending
+}
+
+function Export-ZeroChangeReport {
+    param([object[]]$Summary, [string]$Path)
+
+    $zeroReport = foreach ($name in $Script:Tier0Names) {
+        $match = $Summary | Where-Object { $_.GroupKey -like "*$name*" }
+        if (-not $match) {
+            [pscustomobject]@{
+                GroupKey         = $name
+                TotalChanges     = 0
+                Adds             = 0
+                Removes          = 0
+                FirstSeen        = $null
+                LastSeen         = $null
+                UniqueActorCount = 0
+            }
+        }
+    }
+
+    $file = Join-Path $Path 'Zero-Change-Report.csv'
+    $zeroReport | Export-Csv -Path $file -NoTypeInformation
+    Write-Host "Exported $file" -ForegroundColor Green
+}
+
+function Export-Reports {
+    param([object[]]$Events, [string]$Path)
+
+    Initialize-ReportFolder -Path $Path
+
+    $summary = @(Get-ChangeSummary -Events $Events)
+    $tier0 = @(Get-Tier0Results -Events $Events)
+    $overview = $summary | Select-Object -First $TopCount -Property GroupKey, TotalChanges, Adds, Removes, FirstSeen, LastSeen, UniqueActorCount
+
+    $eventsFile = Join-Path $Path 'Directory-Change-Events.csv'
+    $summaryFile = Join-Path $Path 'Combined-Overview.csv'
+    $tier0File = Join-Path $Path 'Tier-0-Report.csv'
+
+    $Events | Export-Csv -Path $eventsFile -NoTypeInformation
+    $overview | Export-Csv -Path $summaryFile -NoTypeInformation
+    $tier0 | Export-Csv -Path $tier0File -NoTypeInformation
+    Export-ZeroChangeReport -Summary $summary -Path $Path
+
+    Write-Host "Exported $eventsFile" -ForegroundColor Green
+    Write-Host "Exported $summaryFile" -ForegroundColor Green
+    Write-Host "Exported $tier0File" -ForegroundColor Green
+}
+
+function Show-CombinedOverview {
+    param([object[]]$Events)
+
+    Get-ChangeSummary -Events $Events |
+        Select-Object -First $TopCount -Property GroupKey, TotalChanges, Adds, Removes, FirstSeen, LastSeen, UniqueActorCount |
+        Format-Table -AutoSize
+}
+
+function Show-Tier0Report {
+    param([object[]]$Events)
+
+    Get-Tier0Results -Events $Events |
+        Select-Object -Property TimeCreated, ComputerName, EventId, Action, Target, Actor |
+        Format-Table -AutoSize
+}
+
+function Show-ZeroChangeReport {
+    param([object[]]$Events)
+
+    $summary = @(Get-ChangeSummary -Events $Events)
+    $zeroResults = foreach ($name in $Script:Tier0Names) {
+        $match = $summary | Where-Object { $_.GroupKey -like "*$name*" }
+        if (-not $match) {
+            [pscustomobject]@{
+                Tier0Object = $name
+                Status      = 'No changes found in selected period'
+            }
+        }
+    }
+    if (-not $zeroResults -or $zeroResults.Count -eq 0) {
+        Write-Host 'No zero-change Tier-0 objects found. Tracked Tier-0 objects either had detected changes or were not matched by the summary logic.' -ForegroundColor Yellow
+        return
+    }
+    $zeroResults | Format-Table -AutoSize
+}
+
+function Invoke-FullAudit {
+    Initialize-ReportFolder -Path $OutputPath
+    $targets = @(Get-TargetDomainControllers)
+    $events = @(Get-DirectoryChangeEvents -ComputerName $targets)
+    if (-not $events -or $events.Count -eq 0) {
+        Write-Warning 'No matching directory or group membership change events were found.'
+        return
+    }
+    Export-Reports -Events $events -Path $OutputPath
+    Show-CombinedOverview -Events $events
+    Write-Host "Full audit complete. Reports exported to $OutputPath" -ForegroundColor Green
+}
+Invoke-FullAudit
+

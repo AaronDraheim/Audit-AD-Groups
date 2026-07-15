@@ -12,12 +12,9 @@ documentation, even if Microsoft has been advised of the possibility of such dam
 .SYNOPSIS
     Active Directory change review script with Tier-0 reporting, zero-change reporting, combined overview, and CSV exports. Comments have been added throughout to explain the purpose of each major section and function.
 
-.DESCRIPTION
-    Queries domain controller security logs for the same event IDs used by the original script, summarizes adds/removes/changes, exports CSV reports, and provides an interactive menu.
-#>
-
 # Enables common PowerShell cmdlet behavior such as -Verbose and -ErrorAction when the script is run.
 [CmdletBinding()]
+
 # Script parameters control where reports are saved, how far back to search, how many results to show, which domain controllers to query, and whether audit policy should be checked or enabled.
 param(
     [string]$OutputPath = (Join-Path -Path (Get-Location) -ChildPath "AD-ChangeReports"),

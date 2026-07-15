@@ -1,0 +1,474 @@
+<#
+.SYNOPSIS
+    Active Directory change review script with Tier-0 reporting, zero-change reporting, combined overview, and CSV exports. Comments have been added throughout to explain the purpose of each major section and function.
+
+.DESCRIPTION
+    Queries domain controller security logs for the same event IDs used by the original script, summarizes adds/removes/changes, exports CSV reports, and provides an interactive menu.
+#>
+
+# Enables common PowerShell cmdlet behavior such as -Verbose and -ErrorAction when the script is run.
+[CmdletBinding()]
+# Script parameters control where reports are saved, how far back to search, how many results to show, which domain controllers to query, and whether audit policy should be checked or enabled.
+param(
+    [string]$OutputPath,
+    [int]$DaysBack = 30,
+    [int]$TopCount = 25,
+    [string[]]$DomainControllers = @(),
+    [switch]$CheckAuditPolicy,
+    [switch]$OfferEnableAuditPolicy
+)
+
+# Strict mode and Stop-level error handling help catch scripting mistakes and make failures easier to troubleshoot.
+Set-StrictMode -Version 2.0
+$ErrorActionPreference = 'Stop'
+
+# Security event IDs included in the report. These cover user lifecycle events, group creation/deletion, group membership changes, and directory object changes.
+$Script:EventIds = @(
+    4720, 4722, 4723, 4724, 4725, 4726, 4738, 4740, 4767,
+    4727, 4728, 4729, 4730, 4731, 4732, 4733, 4734, 4735,
+    4737, 4754, 4755, 4756, 4757, 4758, 4764, 5136, 5137,
+    5138, 5139, 5141
+)
+
+# Tier-0 or highly privileged built-in groups to highlight separately because changes to these groups usually require closer review.
+$Script:Tier0Names = @(
+    'Administrators', 'Domain Admins', 'Enterprise Admins', 'Schema Admins',
+    'Account Operators', 'Backup Operators', 'Server Operators', 'Print Operators',
+    'DnsAdmins', 'Group Policy Creator Owners', 'Enterprise Key Admins', 'Key Admins'
+)
+$Script:AuditPolicyStatus = @()
+$Script:AuditPolicyStatusAfterEnable = @()
+# Audit policy subcategories needed to produce the events this script depends on.
+$Script:RequiredAuditPolicySubcategories = @(
+    'Security Group Management', 'User Account Management', 'Directory Service Changes'
+)
+
+function Resolve-ReportFolder {
+    param([string]$Path)
+    while ([string]::IsNullOrWhiteSpace($Path)) {
+        $Path = Read-Host 'Enter the output folder path for CSV reports'
+    }
+    $resolvedPath = [System.Environment]::ExpandEnvironmentVariables($Path.Trim())
+    Initialize-ReportFolder -Path $resolvedPath
+    return $resolvedPath
+}
+# Prompts for the output folder path when one is not provided and creates the folder if it does not already exist so CSV exports do not fail because of a missing path.
+function Initialize-ReportFolder {
+    param([string]$Path)
+    if ([string]::IsNullOrWhiteSpace($Path)) { throw 'Output folder path cannot be empty.' }
+    if ((Test-Path -LiteralPath $Path) -and -not (Get-Item -LiteralPath $Path).PSIsContainer) { throw "The output path exists but is not a folder: $Path" }
+    if (-not (Test-Path -LiteralPath $Path)) {
+        New-Item -Path $Path -ItemType Directory -Force | Out-Null
+    }
+}
+function Export-CsvWithNoResults {
+    param([object[]]$Data, [string]$Path, [string[]]$Headers)
+    if ($Data -and $Data.Count -gt 0) {
+        $Data | Export-Csv -Path $Path -NoTypeInformation
+        return
+    }
+    $row = [ordered]@{}
+    foreach ($header in $Headers) { $row[$header] = '' }
+    if ($Headers.Count -gt 0) { $row[$Headers[0]] = 'No results found' }
+    [pscustomobject]$row | Export-Csv -Path $Path -NoTypeInformation
+}
+function Export-SingleCsvReport {
+    param([string]$Path, [hashtable]$WorksheetData)
+    $singleCsvFile = Join-Path $Path 'AD-Change-Audit-Report.csv'
+    $rows = New-Object System.Collections.Generic.List[object]
+    foreach ($sectionName in $WorksheetData.Keys) {
+        $sheet = $WorksheetData[$sectionName]
+        $dataRows = @($sheet.Data)
+        if (-not $dataRows -or $dataRows.Count -eq 0) { $dataRows = @([pscustomobject]@{ Status = 'No results found' }) }
+        foreach ($item in $dataRows) {
+            $row = [ordered]@{ ReportSection = $sectionName }
+            foreach ($header in $sheet.Headers) { if ($item.PSObject.Properties.Name -contains $header) { $row[$header] = $item.$header } else { $row[$header] = '' } }
+            if ($item.PSObject.Properties.Name -contains 'Status') { $row['Status'] = $item.Status }
+            $rows.Add([pscustomobject]$row)
+        }
+    }
+    $rows | Export-Csv -Path $singleCsvFile -NoTypeInformation
+    Write-Host "Exported single CSV report $singleCsvFile" -ForegroundColor Green
+}
+function Export-ExcelWorkbookIfAvailable {
+    param([string]$WorkbookPath, [hashtable]$WorksheetData)
+    if (-not (Get-Module -ListAvailable -Name ImportExcel)) { return $false }
+    Import-Module ImportExcel -ErrorAction Stop
+    if (Test-Path -LiteralPath $WorkbookPath) { Remove-Item -LiteralPath $WorkbookPath -Force }
+    foreach ($sheetName in $WorksheetData.Keys) {
+        $sheet = $WorksheetData[$sheetName]
+        Export-CsvWithNoResults -Data @($sheet.Data) -Path ($env:TEMP + '\ad-audit-temp.csv') -Headers $sheet.Headers
+        Import-Csv ($env:TEMP + '\ad-audit-temp.csv') | Export-Excel -Path $WorkbookPath -WorksheetName $sheetName -AutoSize -FreezeTopRow -BoldTopRow -Append
+    }
+    Remove-Item ($env:TEMP + '\ad-audit-temp.csv') -ErrorAction SilentlyContinue
+    return $true
+}
+
+# Determines whether a requested computer name refers to the local system. Local checks can use direct commands; remote systems require remote execution.
+function Test-IsLocalComputer {
+    param([string]$ComputerName)
+
+    if ([string]::IsNullOrWhiteSpace($ComputerName)) { return $true }
+
+    $target = $ComputerName.Trim()
+    $localNames = @(
+        '.',
+        'localhost',
+        $env:COMPUTERNAME,
+        "$env:COMPUTERNAME.$env:USERDNSDOMAIN"
+    ) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+
+    return ($localNames | ForEach-Object { $_.ToLowerInvariant() }) -contains $target.ToLowerInvariant()
+}
+
+# Builds the list of domain controllers to query. If domain controllers are provided as parameters, those are used; otherwise the script tries to discover them from Active Directory.
+function Get-TargetDomainControllers {
+    if ($DomainControllers -and $DomainControllers.Count -gt 0) {
+        return $DomainControllers
+    }
+
+    try {
+        Import-Module ActiveDirectory -ErrorAction Stop
+        return (Get-ADDomainController -Filter * | Select-Object -ExpandProperty HostName)
+    }
+    catch {
+        Write-Warning "ActiveDirectory module/domain controller discovery failed. Using local computer. $($_.Exception.Message)"
+        return @($env:COMPUTERNAME)
+    }
+}
+# Checks whether Success auditing is enabled for each required audit policy subcategory on each target computer.
+function Get-AuditPolicyStatus {
+    param([string[]]$ComputerName)
+    $status = New-Object System.Collections.Generic.List[object]
+    foreach ($computer in $ComputerName) {
+        foreach ($subcategory in $Script:RequiredAuditPolicySubcategories) {
+            try {
+                if (Test-IsLocalComputer -ComputerName $computer) {
+                    $raw = auditpol.exe /get /subcategory:"$subcategory" 2>$null
+                }
+                else {
+                    $raw = Invoke-Command -ComputerName $computer -ScriptBlock { param($s) auditpol.exe /get /subcategory:"$s" 2>$null } -ArgumentList $subcategory
+                }
+                $successEnabled = (($raw -join ' ') -match 'Success')
+                $status.Add([pscustomobject]@{ ComputerName = $computer; Subcategory = $subcategory; SuccessEnabled = $successEnabled; RawOutput = ($raw -join ' ') })
+            }
+            catch {
+                $status.Add([pscustomobject]@{ ComputerName = $computer; Subcategory = $subcategory; SuccessEnabled = $false; RawOutput = $_.Exception.Message })
+            }
+        }
+    }
+    return $status
+}
+# Optionally enables the recommended audit policy subcategories locally on the queried computer. Group Policy is still the preferred way to enforce these settings consistently.
+function Enable-RecommendedAuditPolicy {
+    param([string[]]$ComputerName)
+    foreach ($computer in $ComputerName) {
+        foreach ($subcategory in $Script:RequiredAuditPolicySubcategories) {
+            try {
+                if (Test-IsLocalComputer -ComputerName $computer) { auditpol.exe /set /subcategory:"$subcategory" /success:enable | Out-Null }
+                else { Invoke-Command -ComputerName $computer -ScriptBlock { param($s) auditpol.exe /set /subcategory:"$s" /success:enable | Out-Null } -ArgumentList $subcategory }
+            }
+            catch { Write-Warning "Failed to enable audit policy '$subcategory' on $computer. $($_.Exception.Message)" }
+        }
+    }
+}
+# Queries the Security event log on each target domain controller, converts each matching event to XML, extracts useful fields, labels the event action, and normalizes it as Add, Remove, or Change.
+function Get-DirectoryChangeEvents {
+    param(
+        [string[]]$ComputerName,
+        [datetime]$StartTime = (Get-Date).AddDays(-$DaysBack),
+        [int[]]$EventId = $Script:EventIds
+    )
+
+# Store parsed results in a list so each event can be converted into a consistent custom object for reporting.
+    $events = New-Object System.Collections.Generic.List[object]
+
+    foreach ($computer in $ComputerName) {
+        Write-Host "Querying Security log on $computer ..." -ForegroundColor Cyan
+        $filter = @{
+            LogName   = 'Security'
+            Id        = $EventId
+            StartTime = $StartTime
+        }
+
+        try {
+            if (Test-IsLocalComputer -ComputerName $computer) {
+                $rawEvents = Get-WinEvent -FilterHashtable $filter -ErrorAction Stop
+            }
+            else {
+                $rawEvents = Get-WinEvent -ComputerName $computer -FilterHashtable $filter -ErrorAction Stop
+            }
+
+            foreach ($event in $rawEvents) {
+                $xml = [xml]$event.ToXml()
+                $data = @{}
+                foreach ($node in $xml.Event.EventData.Data) {
+                    if ($node.Name) { $data[$node.Name] = [string]$node.'#text' }
+                }
+
+# Try several possible event fields to identify the object or account that changed, because different event IDs expose different field names.
+                $targetName = $data['TargetUserName']
+                if ([string]::IsNullOrWhiteSpace($targetName)) { $targetName = $data['TargetAccount'] }
+                if ([string]::IsNullOrWhiteSpace($targetName)) { $targetName = $data['ObjectName'] }
+                if ([string]::IsNullOrWhiteSpace($targetName)) { $targetName = $data['MemberName'] }
+
+                $actor = $data['SubjectUserName']
+                if ([string]::IsNullOrWhiteSpace($actor)) { $actor = $data['UserName'] }
+
+# Translate numeric event IDs into readable action names for easier review in the console and exported CSV files.
+                $action = switch ($event.Id) {
+                    4720 { 'User Created' }
+                    4722 { 'User Enabled' }
+                    4723 { 'Password Change Attempt' }
+                    4724 { 'Password Reset' }
+                    4725 { 'User Disabled' }
+                    4726 { 'User Deleted' }
+                    4738 { 'User Changed' }
+                    4740 { 'User Locked Out' }
+                    4767 { 'User Unlocked' }
+                    4727 { 'Global Group Created' }
+                    4728 { 'Member Added To Global Group' }
+                    4729 { 'Member Removed From Global Group' }
+                    4730 { 'Global Group Deleted' }
+                    4731 { 'Local Group Created' }
+                    4732 { 'Member Added To Local Group' }
+                    4733 { 'Member Removed From Local Group' }
+                    4734 { 'Local Group Deleted' }
+                    4735 { 'Local Group Changed' }
+                    4737 { 'Global Group Changed' }
+                    4754 { 'Universal Group Created' }
+                    4755 { 'Universal Group Changed' }
+                    4756 { 'Member Added To Universal Group' }
+                    4757 { 'Member Removed From Universal Group' }
+                    4758 { 'Universal Group Deleted' }
+                    4764 { 'Group Type Changed' }
+                    5136 { 'Directory Object Modified' }
+                    5137 { 'Directory Object Created' }
+                    5138 { 'Directory Object Undeleted' }
+                    5139 { 'Directory Object Moved' }
+                    5141 { 'Directory Object Deleted' }
+                    default { 'Directory Change' }
+                }
+
+# Normalize each event into a simple change category so reports can quickly summarize adds, removals, and other changes.
+                $changeType = if ($event.Id -in 4728,4732,4756,4720,4722,5137,5138) { 'Add' }
+                              elseif ($event.Id -in 4729,4733,4757,4725,4726,5141) { 'Remove' }
+                              else { 'Change' }
+
+                $events.Add([pscustomobject]@{
+                    TimeCreated  = $event.TimeCreated
+                    ComputerName = $computer
+                    EventId      = $event.Id
+                    Action       = $action
+                    ChangeType   = $changeType
+                    Target       = $targetName
+                    Actor        = $actor
+                    Message      = $event.Message
+                })
+            }
+        }
+        catch {
+            Write-Warning "Failed to query $computer. $($_.Exception.Message)"
+        }
+    }
+
+    return $events | Sort-Object TimeCreated -Descending
+}
+
+# Groups parsed events by target object and calculates totals, add/remove counts, first and last observed change, and unique actors.
+function Get-ChangeSummary {
+    param([object[]]$Events)
+
+    $Events | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_.Target) } |
+        Group-Object -Property Target |
+        ForEach-Object {
+            $groupEvents = $_.Group
+            [pscustomobject]@{
+                GroupKey         = $_.Name
+                TotalChanges     = $groupEvents.Count
+                Adds             = @($groupEvents | Where-Object { $_.ChangeType -eq 'Add' }).Count
+                Removes          = @($groupEvents | Where-Object { $_.ChangeType -eq 'Remove' }).Count
+                FirstSeen        = ($groupEvents | Sort-Object TimeCreated | Select-Object -First 1).TimeCreated
+                LastSeen         = ($groupEvents | Sort-Object TimeCreated -Descending | Select-Object -First 1).TimeCreated
+                UniqueActorCount = @($groupEvents | Where-Object { $_.Actor } | Select-Object -ExpandProperty Actor -Unique).Count
+            }
+        } |
+        Sort-Object TotalChanges -Descending
+}
+
+# Filters the event list for activity involving Tier-0 group names, either in the parsed target field or the original event message.
+function Get-Tier0Results {
+    param([object[]]$Events)
+
+    $Events |
+        Where-Object {
+            $target = if ($_.PSObject.Properties.Name -contains 'Target') { [string]$_.Target } else { '' }
+            $message = if ($_.PSObject.Properties.Name -contains 'Message') { [string]$_.Message } else { '' }
+            ($Script:Tier0Names | Where-Object { $target -like "*$([WildcardPattern]::Escape($_))*" -or $message -like "*$([WildcardPattern]::Escape($_))*" }).Count -gt 0
+        } |
+        Sort-Object TimeCreated -Descending
+}
+
+# Creates a report showing which tracked Tier-0 groups had no detected changes during the selected time window.
+function Export-ZeroChangeReport {
+    param([object[]]$Summary, [string]$Path)
+
+    $zeroReport = foreach ($name in $Script:Tier0Names) {
+        $match = $Summary | Where-Object { $_.GroupKey -like "*$([WildcardPattern]::Escape($name))*" }
+        if (-not $match) {
+            [pscustomobject]@{
+                GroupKey         = $name
+                TotalChanges     = 0
+                Adds             = 0
+                Removes          = 0
+                FirstSeen        = $null
+                LastSeen         = $null
+                UniqueActorCount = 0
+            }
+        }
+    }
+
+    if (-not $Summary -or $Summary.Count -eq 0) { return @([pscustomobject]@{ GroupKey = 'All tracked Tier-0 groups'; TotalChanges = 0; Adds = 0; Removes = 0; FirstSeen = $null; LastSeen = $null; UniqueActorCount = 0; Status = 'No matching directory change events found in selected period' }) }
+    return @($zeroReport)
+}
+
+# Exports one Excel workbook when the ImportExcel module is available. If ImportExcel is not installed, the script exports one consolidated CSV report containing all report sections.
+function Export-Reports {
+    param([object[]]$Events, [string]$Path)
+
+    Initialize-ReportFolder -Path $Path
+
+    $summary = @(Get-ChangeSummary -Events $Events)
+    $tier0 = @(Get-Tier0Results -Events $Events)
+    $overview = $summary | Select-Object -First $TopCount -Property GroupKey, TotalChanges, Adds, Removes, FirstSeen, LastSeen, UniqueActorCount
+
+
+    $workbookFile = Join-Path $Path 'AD-Change-Audit-Report.xlsx'
+    $worksheets = [ordered]@{
+        'Directory Changes' = @{ Data = @($Events); Headers = @('TimeCreated','ComputerName','EventId','Action','ChangeType','Target','Actor','Message') }
+        'Combined Overview' = @{ Data = @($overview); Headers = @('GroupKey','TotalChanges','Adds','Removes','FirstSeen','LastSeen','UniqueActorCount') }
+        'Tier 0 Report' = @{ Data = @($tier0); Headers = @('TimeCreated','ComputerName','EventId','Action','ChangeType','Target','Actor','Message') }
+        'Zero Change Report' = @{ Data = @(Export-ZeroChangeReport -Summary $summary -Path $Path); Headers = @('GroupKey','TotalChanges','Adds','Removes','FirstSeen','LastSeen','UniqueActorCount') }
+        'Audit Policy Status' = @{ Data = @($script:AuditPolicyStatus); Headers = @('ComputerName','Subcategory','SuccessEnabled','RawOutput') }
+        'Audit Policy After Enable' = @{ Data = @($script:AuditPolicyStatusAfterEnable); Headers = @('ComputerName','Subcategory','SuccessEnabled','RawOutput') }
+    }
+    if (Export-ExcelWorkbookIfAvailable -WorkbookPath $workbookFile -WorksheetData $worksheets) {
+        Write-Host "Exported single Excel workbook $workbookFile" -ForegroundColor Green
+        return
+    }
+    Export-SingleCsvReport -Path $Path -WorksheetData $worksheets
+
+}
+
+# Displays the highest-change objects in the console so the reviewer can quickly see where the most activity occurred.
+function Show-CombinedOverview {
+    param([object[]]$Events)
+
+    Get-ChangeSummary -Events $Events |
+        Select-Object -First $TopCount -Property GroupKey, TotalChanges, Adds, Removes, FirstSeen, LastSeen, UniqueActorCount |
+        Format-Table -AutoSize
+}
+
+# Displays only the Tier-0-related events in a compact console table.
+function Show-Tier0Report {
+    param([object[]]$Events)
+
+    Get-Tier0Results -Events $Events |
+        Select-Object -Property TimeCreated, ComputerName, EventId, Action, Target, Actor |
+        Format-Table -AutoSize
+}
+
+# Displays tracked Tier-0 objects that did not have detected changes in the selected reporting period.
+function Show-ZeroChangeReport {
+    param([object[]]$Events)
+
+    $summary = @(Get-ChangeSummary -Events $Events)
+    $zeroResults = foreach ($name in $Script:Tier0Names) {
+        $match = $summary | Where-Object { $_.GroupKey -like "*$([WildcardPattern]::Escape($name))*" }
+        if (-not $match) {
+            [pscustomobject]@{
+                Tier0Object = $name
+                Status      = 'No changes found in selected period'
+            }
+        }
+    }
+    if (-not $zeroResults -or $zeroResults.Count -eq 0) {
+        Write-Host 'No zero-change Tier-0 objects found. Tracked Tier-0 objects either had detected changes or were not matched by the summary logic.' -ForegroundColor Yellow
+        return
+    }
+    $zeroResults | Format-Table -AutoSize
+}
+# Prints the interactive menu the operator uses to choose the audit workflow.
+function Show-MainMenu {
+    Write-Host ''
+    Write-Host 'AD Change Audit Menu' -ForegroundColor Cyan
+    Write-Host '1. Run full audit'
+    Write-Host '2. Check audit policy only'
+    Write-Host '3. Run full audit with audit policy check'
+    Write-Host '4. Run full audit and offer to enable missing audit policy'
+    Write-Host '5. Exit'
+}
+# Runs only the audit policy validation workflow and exports the current audit policy status.
+function Show-AuditPolicyOnly {
+    $script:OutputPath = Resolve-ReportFolder -Path $OutputPath
+    $targets = @(Get-TargetDomainControllers)
+    $auditStatus = @(Get-AuditPolicyStatus -ComputerName $targets)
+    $auditStatus | Select-Object ComputerName, Subcategory, SuccessEnabled | Format-Table -AutoSize
+    $script:AuditPolicyStatus = @($auditStatus)
+    Export-Reports -Events @() -Path $script:OutputPath
+}
+
+# Main audit workflow: prepares the output folder, discovers targets, optionally checks or enables audit policy, gathers matching events, exports reports, and displays the combined overview.
+function Invoke-FullAudit {
+    param([switch]$DoAuditPolicyCheck, [switch]$DoOfferEnableAuditPolicy)
+    $script:OutputPath = Resolve-ReportFolder -Path $OutputPath
+    $script:AuditPolicyStatus = @()
+    $script:AuditPolicyStatusAfterEnable = @()
+    $targets = @(Get-TargetDomainControllers)
+    if ($DoAuditPolicyCheck -or $DoOfferEnableAuditPolicy) {
+        $auditStatus = @(Get-AuditPolicyStatus -ComputerName $targets)
+        $script:AuditPolicyStatus = @($auditStatus)
+        $missingAuditPolicy = @($auditStatus | Where-Object { -not $_.SuccessEnabled })
+        if ($missingAuditPolicy.Count -gt 0) {
+            Write-Warning 'One or more recommended audit policy subcategories are not enabled for Success auditing.'
+            $missingAuditPolicy | Select-Object ComputerName, Subcategory, SuccessEnabled | Format-Table -AutoSize
+            if ($DoOfferEnableAuditPolicy) {
+                Write-Host 'Microsoft recommends configuring Advanced Audit Policy through Group Policy for consistent domain controller coverage. This option enables the setting locally on the queried computer(s) and may be overwritten by GPO.' -ForegroundColor Yellow
+                $answer = Read-Host 'Enable recommended audit policy settings locally on the queried computer(s) now? [Y/N]'
+                if ($answer -match '^[Yy]$') {
+                    Enable-RecommendedAuditPolicy -ComputerName $targets
+                    Write-Host 'Rechecking audit policy status after enable attempt...' -ForegroundColor Cyan
+                    $auditStatusAfterEnable = @(Get-AuditPolicyStatus -ComputerName $targets)
+                    $auditStatusAfterEnable | Select-Object ComputerName, Subcategory, SuccessEnabled | Format-Table -AutoSize
+                    $script:AuditPolicyStatusAfterEnable = @($auditStatusAfterEnable)
+                }
+            }
+        }
+    }
+    $events = @(Get-DirectoryChangeEvents -ComputerName $targets)
+    if (-not $events -or $events.Count -eq 0) {
+        Write-Warning 'No matching directory or group membership change events were found for the selected event IDs and time window.'
+        Export-Reports -Events @() -Path $script:OutputPath
+        Write-Host '1. Run menu option 2 to confirm required audit policy subcategories are enabled.'
+        Write-Host '2. Increase -DaysBack if expected changes are older than the current window.'
+        Write-Host '3. Confirm the script is querying the domain controller that processed the change.'
+        Write-Host '4. Generate a test group membership change and rerun the audit.'
+        return
+    }
+    Export-Reports -Events $events -Path $script:OutputPath
+    Show-CombinedOverview -Events $events
+    Write-Host "Full audit complete. Reports exported to $script:OutputPath" -ForegroundColor Green
+}
+# Keeps showing the menu until the user chooses Exit. Each option calls the matching workflow function.
+do {
+    Show-MainMenu
+    $choice = Read-Host 'Select option'
+    switch ($choice) {
+        '1' { Invoke-FullAudit }
+        '2' { Show-AuditPolicyOnly }
+        '3' { Invoke-FullAudit -DoAuditPolicyCheck }
+        '4' { Invoke-FullAudit -DoAuditPolicyCheck -DoOfferEnableAuditPolicy }
+        '5' { Write-Host 'Exiting.' -ForegroundColor Green }
+        default { Write-Host 'Invalid option. Choose 1 through 5.' -ForegroundColor Yellow }
+    }
+} while ($choice -ne '5')

@@ -59,7 +59,7 @@ $Script:CachedReachableDomainControllersScanTime = $null
 $Script:RequiredAuditPolicySubcategories = @(
     'Security Group Management', 'User Account Management', 'Directory Service Changes'
 )
-# Human-readable explanation of each required audit policy subcategory: what it controls, which event IDs it produces for this report, where it is configured in Group Policy, and what is lost when it is not enabled. Displayed by menu option 2 before the check runs so the operator can see exactly what is being validated and why.
+# readable explanation of each required audit policy subcategory: what it controls, which event IDs it produces for this report, where it is configured in Group Policy, and what is lost when it is not enabled. Displayed by menu option 2 before the check runs so the operator can see exactly what is being validated and why.
 $Script:AuditPolicyExplanations = [ordered]@{
     'Security Group Management' = [pscustomobject]@{
         Category    = 'Account Management'

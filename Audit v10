@@ -62,7 +62,7 @@ $Script:CachedReachableDomainControllersScanTime = $null
 $Script:RequiredAuditPolicySubcategories = @(
     'Security Group Management', 'User Account Management', 'Directory Service Changes'
 )
-# Human-readable explanation of each required audit policy subcategory: what it controls, which event IDs it produces for this report, where it is configured in Group Policy, and what is lost when it is not enabled. Displayed by menu option 2 before the check runs so the operator can see exactly what is being validated and why.
+# Readable explanation of each required audit policy subcategory: what it controls, which event IDs it produces for this report, where it is configured in Group Policy, and what is lost when it is not enabled. Displayed by menu option 2 before the check runs so the operator can see exactly what is being validated and why.
 $Script:AuditPolicyExplanations = [ordered]@{
     'Security Group Management' = [pscustomobject]@{
         Category    = 'Account Management'
@@ -284,7 +284,7 @@ function Enable-RecommendedAuditPolicy {
         }
     }
 }
-# Queries the Security event log on each target domain controller, converts each matching event to XML, extracts useful fields, labels the event action, and normalizes it as Add, Remove, or Change.
+# Queries the Security event log on each target domain controller, extracts useful fields from each matching event, labels the event action, and normalizes it as Add, Remove, or Change. Each event is projected into a plain object with its XML captured as a string inside the background job, before the results cross the job serialization boundary. Objects returned by Receive-Job come back as Deserialized.System.Diagnostics.Eventing.Reader.EventLogRecord property bags with no methods attached, so calling ToXml() on them in the caller fails with "does not contain a method named 'ToXml'". Calling it inside the job, where the live EventLogRecord still exists, avoids that.
 function Get-DirectoryChangeEvents {
     param(
         [string[]]$ComputerName,
@@ -305,7 +305,7 @@ function Get-DirectoryChangeEvents {
             StartTime = $StartTime
         }
 
-        $queryJob = Start-Job -ScriptBlock { param($target,$eventFilter,$isLocal) $allIds = @($eventFilter['Id']); for ($i = 0; $i -lt $allIds.Count; $i += 20) { $chunkFilter = @{ LogName = $eventFilter['LogName']; StartTime = $eventFilter['StartTime']; Id = @($allIds[$i..([Math]::Min($i + 19, $allIds.Count - 1))]) }; try { if ($isLocal) { Get-WinEvent -FilterHashtable $chunkFilter -ErrorAction Stop } else { Get-WinEvent -ComputerName $target -FilterHashtable $chunkFilter -ErrorAction Stop } } catch { if ($_.Exception.Message -notmatch 'No events were found') { throw } } } } -ArgumentList $computer,$filter,(Test-IsLocalComputer -ComputerName $computer)
+        $queryJob = Start-Job -ScriptBlock { param($target,$eventFilter,$isLocal) $allIds = @($eventFilter['Id']); for ($i = 0; $i -lt $allIds.Count; $i += 20) { $chunkFilter = @{ LogName = $eventFilter['LogName']; StartTime = $eventFilter['StartTime']; Id = @($allIds[$i..([Math]::Min($i + 19, $allIds.Count - 1))]) }; try { $chunk = if ($isLocal) { Get-WinEvent -FilterHashtable $chunkFilter -ErrorAction Stop } else { Get-WinEvent -ComputerName $target -FilterHashtable $chunkFilter -ErrorAction Stop }; foreach ($record in $chunk) { [pscustomobject]@{ TimeCreated = $record.TimeCreated; Id = $record.Id; Message = $record.Message; Xml = $record.ToXml() } } } catch { if ($_.Exception.Message -notmatch 'No events were found') { throw } } } } -ArgumentList $computer,$filter,(Test-IsLocalComputer -ComputerName $computer)
         try {
             $completed = Wait-Job -Job $queryJob -Timeout $DcQueryTimeoutSeconds
             if (-not $completed) { Stop-Job -Job $queryJob -ErrorAction SilentlyContinue; throw "Security log query exceeded the $DcQueryTimeoutSeconds-second per-DC limit." }
@@ -314,7 +314,7 @@ function Get-DirectoryChangeEvents {
             Remove-Job -Job $queryJob -Force -ErrorAction SilentlyContinue
 
             foreach ($event in $rawEvents) {
-                $xml = [xml]$event.ToXml()
+                $xml = [xml]$event.Xml
                 $data = @{}
                 foreach ($node in $xml.Event.EventData.Data) {
                     if ($node.Name) { $data[$node.Name] = [string]$node.'#text' }
@@ -411,7 +411,7 @@ function Get-ChangeSummary {
         Sort-Object TotalChanges -Descending
 }
 
-# Filters the event list for activity involving Tier-0 group names, either in the parsed target field or the original event message.
+# Filters the event list for activity involving Tier-0 group names, either in the parsed target field or the original event message. The Where-Object result is captured in @() before .Count is read: under Set-StrictMode -Version 2.0 a pipeline that returns a single object or nothing has no Count property, so reading .Count directly off the parenthesized pipeline fails with "The property 'Count' cannot be found on this object". Any comparison in this script that reads .Count from pipeline output needs the same @() wrapper.
 function Get-Tier0Results {
     param([object[]]$Events)
 
@@ -419,7 +419,8 @@ function Get-Tier0Results {
         Where-Object {
             $target = if ($_.PSObject.Properties.Name -contains 'Target') { [string]$_.Target } else { '' }
             $message = if ($_.PSObject.Properties.Name -contains 'Message') { [string]$_.Message } else { '' }
-            ($Script:Tier0Names | Where-Object { $target -like "*$([WildcardPattern]::Escape($_))*" -or $message -like "*$([WildcardPattern]::Escape($_))*" }).Count -gt 0
+            $matchedTier0Names = @($Script:Tier0Names | Where-Object { $target -like "*$([WildcardPattern]::Escape($_))*" -or $message -like "*$([WildcardPattern]::Escape($_))*" })
+            $matchedTier0Names.Count -gt 0
         } |
         Sort-Object TimeCreated -Descending
 }
@@ -578,7 +579,7 @@ function Show-ZeroChangeReport {
             }
         }
     }
-    if (-not $zeroResults -or $zeroResults.Count -eq 0) {
+    if (@($zeroResults).Count -eq 0) {
         Write-Host 'No zero-change Tier-0 objects found. Tracked Tier-0 objects either had detected changes or were not matched by the summary logic.' -ForegroundColor Yellow
         return
     }

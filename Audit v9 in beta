@@ -98,7 +98,7 @@ function Export-SingleCsvReport {
         $dataRows = @($sheet.Data)
         if (-not $dataRows -or $dataRows.Count -eq 0) { $dataRows = @([pscustomobject]@{ Status = 'No results found' }) }
         foreach ($item in $dataRows) {
-            $row = [ordered]@{ ReportSection = $sectionName; TimeCreated = ''; ComputerName = ''; EventId = ''; Action = ''; ChangeType = ''; Target = ''; Actor = ''; Message = ''; GroupKey = ''; TotalChanges = ''; Adds = ''; Removes = ''; FirstSeen = ''; LastSeen = ''; UniqueActorCount = ''; GroupName = ''; DistinguishedName = ''; GroupScope = ''; GroupCategory = ''; MembersCount = ''; ManagedBy = ''; IsTier0 = ''; ChangesOverLastXDays = ''; OtherChanges = ''; FirstChangeSeen = ''; LastChangeSeen = ''; Tier0Group = ''; MemberName = ''; MemberSamAccountName = ''; MemberObjectClass = ''; MemberDistinguishedName = ''; RiskNote = ''; Subcategory = ''; SuccessEnabled = ''; RawOutput = ''; Status = '' }
+            $row = [ordered]@{ ReportSection = $sectionName; TimeCreated = ''; ComputerName = ''; EventId = ''; Action = ''; ChangeType = ''; Target = ''; Actor = ''; Message = ''; GroupKey = ''; TotalChanges = ''; Adds = ''; Removes = ''; FirstSeen = ''; LastSeen = ''; UniqueActorCount = ''; GroupName = ''; DistinguishedName = ''; GroupScope = ''; GroupCategory = ''; MembersCount = ''; ManagedBy = ''; IsTier0 = ''; Tier0MemberCount = ''; Tier0Members = ''; ChangesOverLastXDays = ''; OtherChanges = ''; FirstChangeSeen = ''; LastChangeSeen = ''; Tier0Group = ''; MemberName = ''; MemberSamAccountName = ''; MemberObjectClass = ''; MemberDistinguishedName = ''; RiskNote = ''; Subcategory = ''; SuccessEnabled = ''; RawOutput = ''; Status = '' }
             foreach ($header in $sheet.Headers) { if ($item.PSObject.Properties.Name -contains $header) { $row[$header] = $item.$header } }
             if ($item.PSObject.Properties.Name -contains 'Status') { $row['Status'] = $item.Status }
             $rows.Add([pscustomobject]$row)
@@ -138,20 +138,32 @@ function Test-IsLocalComputer {
     return ($localNames | ForEach-Object { $_.ToLowerInvariant() }) -contains $target.ToLowerInvariant()
 }
 
-# Discovers candidate domain controllers, then validates DNS resolution and TCP 135 reachability before reporting. TCP 135 is used as a fast RPC Endpoint Mapper precheck; a successful test does not guarantee that every dynamic RPC port or Security log permission is available.
+# Discovers candidate domain controllers, then validates DNS resolution and TCP 135 reachability before reporting. TCP 135 is used as a fast RPC Endpoint Mapper precheck; a successful test does not guarantee that every dynamic RPC port or Security log permission is available. A Write-Progress bar is displayed while the scan runs, showing the current domain controller, its position in the candidate list, percent complete, the number found reachable so far, and an estimated time remaining based on the average per-DC check time. The bar is cleared with -Completed when the scan finishes, followed by a summary line. Write-Progress output is console-only and is not captured by Start-Transcript or redirected output.
 function Get-TargetDomainControllers {
     $candidates = if ($DomainControllers -and $DomainControllers.Count -gt 0) { @($DomainControllers) } else {
         try { Import-Module ActiveDirectory -ErrorAction Stop; @(Get-ADDomainController -Filter * | Select-Object -ExpandProperty HostName) }
         catch { throw "ActiveDirectory module/domain controller discovery failed. Supply -DomainControllers explicitly. $($_.Exception.Message)" }
     }
+    $candidateList = @($candidates | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -Unique)
     $reachable = New-Object System.Collections.Generic.List[string]
-    foreach ($candidate in ($candidates | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -Unique)) {
+    $totalCandidates = $candidateList.Count
+    $scanIndex = 0
+    $scanActivity = 'Scanning domain controllers for reachability'
+    $scanStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+    foreach ($candidate in $candidateList) {
+        $scanIndex++
+        $percentComplete = if ($totalCandidates -gt 0) { [int]((($scanIndex - 1) / $totalCandidates) * 100) } else { 0 }
+        $secondsRemaining = if ($scanIndex -gt 1) { [int](($scanStopwatch.Elapsed.TotalSeconds / ($scanIndex - 1)) * ($totalCandidates - $scanIndex + 1)) } else { -1 }
+        Write-Progress -Activity $scanActivity -Status ("[{0} of {1}] {2} - {3}% complete, {4} reachable so far" -f $scanIndex, $totalCandidates, $candidate, $percentComplete, $reachable.Count) -CurrentOperation 'Resolving DNS and testing TCP 135 (RPC Endpoint Mapper)' -PercentComplete $percentComplete -SecondsRemaining $secondsRemaining
         if (Test-IsLocalComputer -ComputerName $candidate) { $reachable.Add($candidate); continue }
         $testJob = Start-Job -ScriptBlock { param($name) try { $null = [System.Net.Dns]::GetHostAddresses($name); Test-NetConnection -ComputerName $name -Port 135 -InformationLevel Quiet -WarningAction SilentlyContinue } catch { $false } } -ArgumentList $candidate
         $completed = Wait-Job -Job $testJob -Timeout $ReachabilityTimeoutSeconds
         $isReachable = if ($completed) { [bool](Receive-Job -Job $testJob -ErrorAction SilentlyContinue | Select-Object -Last 1) } else { $false }
         Remove-Job -Job $testJob -Force -ErrorAction SilentlyContinue; if ($isReachable) { $reachable.Add($candidate) } else { Write-Warning "Skipping unreachable domain controller $candidate after a $ReachabilityTimeoutSeconds-second connectivity check." }
     }
+    Write-Progress -Activity $scanActivity -Status 'Scan complete' -PercentComplete 100 -Completed
+    $scanStopwatch.Stop()
+    Write-Host ("Reachability scan finished: {0} of {1} candidate domain controller(s) reachable in {2:N1} second(s)." -f $reachable.Count, $totalCandidates, $scanStopwatch.Elapsed.TotalSeconds) -ForegroundColor Cyan
     if ($reachable.Count -eq 0) { throw 'No reachable domain controllers passed the preflight check. Confirm DNS, firewall/RPC connectivity, and permissions, or provide known targets with -DomainControllers.' }
     Write-Host ("Reachable domain controllers selected for reporting: {0}" -f ($reachable -join ', ')) -ForegroundColor Green
     return @($reachable)
@@ -369,45 +381,99 @@ function Get-ADGroupInventory {
 function Get-ADGroupChangeInventory {
     param([object[]]$Groups, [object[]]$Summary, [int]$Days)
     foreach ($group in $Groups) {
-        $matches = @($Summary | Where-Object { $_.GroupKey -eq $group.GroupName -or $_.GroupKey -like "*$([WildcardPattern]::Escape($group.GroupName))*" -or $_.GroupKey -like "*$([WildcardPattern]::Escape($group.DistinguishedName))*" })
-        $total = if ($matches.Count -gt 0) { ($matches | Measure-Object TotalChanges -Sum).Sum } else { 0 }
-        $adds = if ($matches.Count -gt 0) { ($matches | Measure-Object Adds -Sum).Sum } else { 0 }
-        $removes = if ($matches.Count -gt 0) { ($matches | Measure-Object Removes -Sum).Sum } else { 0 }
-        [pscustomobject]@{ GroupName = $group.GroupName; DistinguishedName = $group.DistinguishedName; GroupScope = $group.GroupScope; GroupCategory = $group.GroupCategory; MembersCount = $group.MembersCount; ManagedBy = $group.ManagedBy; IsTier0 = $group.IsTier0; ChangesOverLastXDays = $total; Adds = $adds; Removes = $removes; OtherChanges = [Math]::Max(($total - $adds - $removes),0); FirstChangeSeen = if ($matches.Count -gt 0) { ($matches | Sort-Object FirstSeen | Select-Object -First 1).FirstSeen } else { $null }; LastChangeSeen = if ($matches.Count -gt 0) { ($matches | Sort-Object LastSeen -Descending | Select-Object -First 1).LastSeen } else { $null }; Status = if ($total -gt 0) { "Changed in last $Days days" } else { "No changes in last $Days days" } }
+        try {
+        $relatedSummaryRows = @($Summary | Where-Object { $_.GroupKey -eq $group.GroupName -or $_.GroupKey -like "*$([WildcardPattern]::Escape($group.GroupName))*" -or $_.GroupKey -like "*$([WildcardPattern]::Escape($group.DistinguishedName))*" })
+        $total = [int]$(if ($relatedSummaryRows.Count -gt 0) { ($relatedSummaryRows | Measure-Object TotalChanges -Sum).Sum } else { 0 })
+        $adds = [int]$(if ($relatedSummaryRows.Count -gt 0) { ($relatedSummaryRows | Measure-Object Adds -Sum).Sum } else { 0 })
+        $removes = [int]$(if ($relatedSummaryRows.Count -gt 0) { ($relatedSummaryRows | Measure-Object Removes -Sum).Sum } else { 0 })
+        [pscustomobject]@{ GroupName = $group.GroupName; DistinguishedName = $group.DistinguishedName; GroupScope = $group.GroupScope; GroupCategory = $group.GroupCategory; MembersCount = $group.MembersCount; ManagedBy = $group.ManagedBy; IsTier0 = $group.IsTier0; ChangesOverLastXDays = $total; Adds = $adds; Removes = $removes; OtherChanges = [Math]::Max(($total - $adds - $removes),0); FirstChangeSeen = if ($relatedSummaryRows.Count -gt 0) { ($relatedSummaryRows | Sort-Object FirstSeen | Select-Object -First 1).FirstSeen } else { $null }; LastChangeSeen = if ($relatedSummaryRows.Count -gt 0) { ($relatedSummaryRows | Sort-Object LastSeen -Descending | Select-Object -First 1).LastSeen } else { $null }; Status = if ($total -gt 0) { "Changed in last $Days days" } else { "No changes in last $Days days" } }
+        }
+        catch { Write-Warning "Failed to compute change inventory for group $($group.GroupName). $($_.Exception.Message)" }
     }
 }
+# Retrieves Tier-0 group membership without using Get-ADGroupMember -Recursive, which Microsoft documents as unreliable when a group contains members that cannot be fully resolved (for example, foreign security principals from a trusted domain/forest, or orphaned SIDs); in those cases it can throw inconsistent client-side errors instead of a clean, catchable one. This walks membership manually with Get-ADObject per member and skips only the unresolved member instead of failing the whole group. Results are written directly to the pipeline instead of being collected in a System.Collections.Generic.List[object] and returned with @($results); the array conversion on return was the source of the "Argument types do not match" ArgumentException. Property values are also coerced to strings and checked for existence before use, because Set-StrictMode -Version 2.0 fails on properties that are not present on every returned object class.
 function Get-Tier0GroupMembers {
-    try { Import-Module ActiveDirectory -ErrorAction Stop; foreach ($groupName in $Script:Tier0Names) { $group = Get-ADGroup -LDAPFilter "(cn=$groupName)" -Properties DistinguishedName,GroupScope,GroupCategory,ManagedBy,Members -ErrorAction SilentlyContinue; if ($group) { $members = @(Get-ADGroupMember -Identity $group.DistinguishedName -Recursive -ErrorAction SilentlyContinue); if ($members.Count -eq 0) { [pscustomobject]@{ Tier0Group = $group.Name; Tier0GroupDistinguishedName = $group.DistinguishedName; Tier0GroupScope = $group.GroupScope; Tier0GroupCategory = $group.GroupCategory; Tier0ManagedBy = $group.ManagedBy; Tier0GroupMemberCount = 0; MemberName = ''; MemberSamAccountName = ''; MemberObjectClass = ''; MemberDistinguishedName = ''; RiskNote = 'No members returned' } } else { foreach ($member in $members) { [pscustomobject]@{ Tier0Group = $group.Name; Tier0GroupDistinguishedName = $group.DistinguishedName; Tier0GroupScope = $group.GroupScope; Tier0GroupCategory = $group.GroupCategory; Tier0ManagedBy = $group.ManagedBy; Tier0GroupMemberCount = $members.Count; MemberName = $member.Name; MemberSamAccountName = $member.SamAccountName; MemberObjectClass = $member.objectClass; MemberDistinguishedName = $member.DistinguishedName; RiskNote = 'Member of high-risk Tier-0 group' } } } } } }
-    catch { Write-Warning "Failed to retrieve Tier-0 group members. $($_.Exception.Message)"; return @() }
+    [CmdletBinding()]
+    param()
+    try { Import-Module ActiveDirectory -ErrorAction Stop }
+    catch { Write-Warning "Failed to load the ActiveDirectory module. $($_.Exception.Message)"; return }
+    foreach ($groupName in $Script:Tier0Names) {
+        Write-Host "[CHECKPOINT] Tier0 group: $groupName" -ForegroundColor DarkGray
+        try {
+            $group = Get-ADGroup -LDAPFilter "(cn=$groupName)" -Properties DistinguishedName,GroupScope,GroupCategory,ManagedBy,Members -ErrorAction SilentlyContinue
+            if (-not $group) { Write-Host "[CHECKPOINT] Group not resolved: $groupName" -ForegroundColor DarkGray; continue }
+            $groupLabel = [string]$group.Name
+            $groupDn = [string]$group.DistinguishedName
+            $groupScope = [string]$group.GroupScope
+            $groupCategory = [string]$group.GroupCategory
+            $groupManagedBy = if ($group.PSObject.Properties['ManagedBy']) { [string]$group.ManagedBy } else { '' }
+            $memberDns = @($group.Members | ForEach-Object { [string]$_ } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+            Write-Host "[CHECKPOINT] $groupLabel member DN count: $($memberDns.Count)" -ForegroundColor DarkGray
+            if ($memberDns.Count -eq 0) {
+                [pscustomobject]@{ Tier0Group = $groupLabel; Tier0GroupDistinguishedName = $groupDn; Tier0GroupScope = $groupScope; Tier0GroupCategory = $groupCategory; Tier0ManagedBy = $groupManagedBy; Tier0GroupMemberCount = 0; MemberName = ''; MemberSamAccountName = ''; MemberObjectClass = ''; MemberDistinguishedName = ''; RiskNote = 'No members returned' }
+                continue
+            }
+            foreach ($memberDn in $memberDns) {
+                try {
+                    $member = Get-ADObject -Identity $memberDn -Properties SamAccountName -ErrorAction Stop
+                    $memberClass = [string]$member.ObjectClass
+                    $memberSam = if ($member.PSObject.Properties['SamAccountName']) { [string]$member.SamAccountName } else { '' }
+                    $riskNote = if ($memberClass -eq 'foreignSecurityPrincipal') { 'Member of high-risk Tier-0 group; unresolved foreign security principal from another domain/forest' } else { 'Member of high-risk Tier-0 group' }
+                    [pscustomobject]@{ Tier0Group = $groupLabel; Tier0GroupDistinguishedName = $groupDn; Tier0GroupScope = $groupScope; Tier0GroupCategory = $groupCategory; Tier0ManagedBy = $groupManagedBy; Tier0GroupMemberCount = $memberDns.Count; MemberName = [string]$member.Name; MemberSamAccountName = $memberSam; MemberObjectClass = $memberClass; MemberDistinguishedName = [string]$member.DistinguishedName; RiskNote = $riskNote }
+                }
+                catch {
+                    Write-Warning "Could not resolve a member of $groupLabel ($memberDn). $($_.Exception.Message)"
+                    [pscustomobject]@{ Tier0Group = $groupLabel; Tier0GroupDistinguishedName = $groupDn; Tier0GroupScope = $groupScope; Tier0GroupCategory = $groupCategory; Tier0ManagedBy = $groupManagedBy; Tier0GroupMemberCount = $memberDns.Count; MemberName = ''; MemberSamAccountName = ''; MemberObjectClass = ''; MemberDistinguishedName = $memberDn; RiskNote = 'Unresolved member (possible foreign security principal or orphaned SID); could not be enumerated' }
+                }
+            }
+        }
+        catch { Write-Warning "Failed to enumerate members of Tier-0 group $groupName. $($_.Exception.Message)" }
+    }
 }
 
 # Exports one Excel workbook when the ImportExcel module is available. If ImportExcel is not installed, the script exports one consolidated CSV report containing all report sections.
 function Export-Reports {
     param([object[]]$Events, [string]$Path)
+    try {
 
+    Write-Host '[CHECKPOINT] Initialize-ReportFolder' -ForegroundColor DarkGray
     Initialize-ReportFolder -Path $Path
 
+    Write-Host '[CHECKPOINT] Get-ChangeSummary' -ForegroundColor DarkGray
     $summary = @(Get-ChangeSummary -Events $Events)
+    Write-Host '[CHECKPOINT] Get-Tier0Results' -ForegroundColor DarkGray
     $tier0 = @(Get-Tier0Results -Events $Events)
+    Write-Host '[CHECKPOINT] overview Select-Object' -ForegroundColor DarkGray
     $overview = $summary | Select-Object -First $TopCount -Property GroupKey, TotalChanges, Adds, Removes, FirstSeen, LastSeen, UniqueActorCount
+    Write-Host '[CHECKPOINT] Get-ADGroupInventory' -ForegroundColor DarkGray
     $groups = @(Get-ADGroupInventory)
+    Write-Host '[CHECKPOINT] Get-ADGroupChangeInventory' -ForegroundColor DarkGray
     $groupInventory = @(Get-ADGroupChangeInventory -Groups $groups -Summary $summary -Days $DaysBack)
+    Write-Host '[CHECKPOINT] Get-Tier0GroupMembers' -ForegroundColor DarkGray
     $tier0Members = @(Get-Tier0GroupMembers)
+    Write-Host '[CHECKPOINT] tier0MemberSummary Group-Object' -ForegroundColor DarkGray
     $tier0MemberSummary = @($tier0Members | Group-Object Tier0Group | ForEach-Object { [pscustomobject]@{ GroupName = $_.Name; Tier0MemberCount = @($_.Group | Where-Object { -not [string]::IsNullOrWhiteSpace($_.MemberSamAccountName) }).Count; Tier0Members = (@($_.Group | Where-Object { -not [string]::IsNullOrWhiteSpace($_.MemberSamAccountName) } | Select-Object -ExpandProperty MemberSamAccountName -Unique) -join '; ') } })
-    $updatedGroupInventory = New-Object System.Collections.Generic.List[object]
-    foreach ($g in $groupInventory) {
+    Write-Host '[CHECKPOINT] updatedGroupInventory foreach loop' -ForegroundColor DarkGray
+    # Built as pipeline output instead of a System.Collections.Generic.List[object]. The @() array conversion applied to that list type is what raised "Argument types do not match" here, the same pattern that failed earlier in Get-Tier0GroupMembers.
+    $updatedGroupInventory = foreach ($g in $groupInventory) {
+        try {
         $memberSummary = $tier0MemberSummary | Where-Object GroupName -EQ $g.GroupName | Select-Object -First 1
         $riskNote = [string]::Empty
         if ($g.IsTier0 -eq $true) { $riskNote = [string]::Concat([char]84,[char]105,[char]101,[char]114,[char]32,[char]48,[char]32,[char]103,[char]114,[char]111,[char]117,[char]112) }
         $tier0MemberCount = [string]::Empty
         $tier0MembersText = [string]::Empty
         if ($null -ne $memberSummary) { $tier0MemberCount = $memberSummary.Tier0MemberCount; $tier0MembersText = $memberSummary.Tier0Members }
-        $updatedGroupInventory.Add([pscustomobject]@{ GroupName = $g.GroupName; DistinguishedName = $g.DistinguishedName; GroupScope = $g.GroupScope; GroupCategory = $g.GroupCategory; MembersCount = $g.MembersCount; ManagedBy = $g.ManagedBy; IsTier0 = $g.IsTier0; Tier0MemberCount = $tier0MemberCount; Tier0Members = $tier0MembersText; ChangesOverLastXDays = $g.ChangesOverLastXDays; Adds = $g.Adds; Removes = $g.Removes; OtherChanges = $g.OtherChanges; FirstChangeSeen = $g.FirstChangeSeen; LastChangeSeen = $g.LastChangeSeen; Status = $g.Status; RiskNote = $riskNote })
+            [pscustomobject]@{ GroupName = $g.GroupName; DistinguishedName = $g.DistinguishedName; GroupScope = $g.GroupScope; GroupCategory = $g.GroupCategory; MembersCount = $g.MembersCount; ManagedBy = $g.ManagedBy; IsTier0 = $g.IsTier0; Tier0MemberCount = $tier0MemberCount; Tier0Members = $tier0MembersText; ChangesOverLastXDays = $g.ChangesOverLastXDays; Adds = $g.Adds; Removes = $g.Removes; OtherChanges = $g.OtherChanges; FirstChangeSeen = $g.FirstChangeSeen; LastChangeSeen = $g.LastChangeSeen; Status = $g.Status; RiskNote = $riskNote }
+        }
+        catch { Write-Host "Failed to build inventory row for group $($g.GroupName): $($_.Exception.Message)" -ForegroundColor Red; Write-Host "  GroupScope=[$($g.GroupScope)] GroupCategory=[$($g.GroupCategory)] MembersCount=[$($g.MembersCount)] Adds=[$($g.Adds)] Removes=[$($g.Removes)] OtherChanges=[$($g.OtherChanges)] FirstChangeSeen=[$($g.FirstChangeSeen)] LastChangeSeen=[$($g.LastChangeSeen)]" -ForegroundColor Red; throw }
     }
+    Write-Host '[CHECKPOINT] groupInventory reassignment complete' -ForegroundColor DarkGray
     $groupInventory = @($updatedGroupInventory)
 
 
+    Write-Host '[CHECKPOINT] workbookFile Join-Path' -ForegroundColor DarkGray
     $workbookFile = Join-Path -Path $Path -ChildPath ([string]::Concat('AD-Change-Audit-Report','.xlsx'))
+    Write-Host '[CHECKPOINT] worksheets hashtable' -ForegroundColor DarkGray
     $worksheets = [ordered]@{
         'Directory Changes' = @{ Data = @($Events); Headers = @('TimeCreated','ComputerName','EventId','Action','ChangeType','Target','Actor','Message') }
         'Combined Overview' = @{ Data = @($overview); Headers = @('GroupKey','TotalChanges','Adds','Removes','FirstSeen','LastSeen','UniqueActorCount') }
@@ -417,12 +483,15 @@ function Export-Reports {
         'Audit Policy Status' = @{ Data = @($script:AuditPolicyStatus); Headers = @('ComputerName','Subcategory','SuccessEnabled','RawOutput') }
         'Audit Policy After Enable' = @{ Data = @($script:AuditPolicyStatusAfterEnable); Headers = @('ComputerName','Subcategory','SuccessEnabled','RawOutput') }
     }
+    Write-Host '[CHECKPOINT] Export-ExcelWorkbookIfAvailable / Export-SingleCsvReport' -ForegroundColor DarkGray
     if (Export-ExcelWorkbookIfAvailable -WorkbookPath $workbookFile -WorksheetData $worksheets) {
         Write-Host "Exported single Excel workbook $workbookFile" -ForegroundColor Green
         return
     }
     Export-SingleCsvReport -Path $Path -WorksheetData $worksheets
 
+    }
+    catch { Write-Host "Export-Reports failed: $($_.Exception.Message)" -ForegroundColor Red; Write-Host "Exception type: $($_.Exception.GetType().FullName)" -ForegroundColor Red; Write-Host "Script stack trace:" -ForegroundColor Red; Write-Host $_.ScriptStackTrace -ForegroundColor Red; if ($_.Exception.InnerException) { Write-Host "Inner exception: $($_.Exception.InnerException.Message)" -ForegroundColor Red }; throw }
 }
 
 # Displays the highest-change objects in the console so the reviewer can quickly see where the most activity occurred.

@@ -51,6 +51,9 @@ $Script:Tier0Names = @(
 )
 $Script:AuditPolicyStatus = @()
 $Script:AuditPolicyStatusAfterEnable = @()
+# Cached reachable domain controller list. Populated by a manual scan (menu option 5) or by the first automatic scan of a run, then reused for the rest of the script's runtime instead of re-scanning before every operation.
+$Script:CachedReachableDomainControllers = $null
+$Script:CachedReachableDomainControllersScanTime = $null
 # Set when -OfferEnableAuditPolicy is supplied directly as a script parameter so the enable prompt is skipped in unattended runs; the switch itself is treated as consent.
 # Audit policy subcategories needed to produce the events this script depends on.
 $Script:RequiredAuditPolicySubcategories = @(
@@ -152,6 +155,24 @@ function Get-TargetDomainControllers {
     if ($reachable.Count -eq 0) { throw 'No reachable domain controllers passed the preflight check. Confirm DNS, firewall/RPC connectivity, and permissions, or provide known targets with -DomainControllers.' }
     Write-Host ("Reachable domain controllers selected for reporting: {0}" -f ($reachable -join ', ')) -ForegroundColor Green
     return @($reachable)
+}
+# Returns the cached reachable domain controller list for this script run if one exists, otherwise runs the reachability scan once and caches the result. Pass -ForceRescan to discard the cache and scan again (used by the "Scan for reachable domain controllers" menu option).
+function Get-CachedTargetDomainControllers {
+    param([switch]$ForceRescan)
+    if (-not $ForceRescan -and $null -ne $Script:CachedReachableDomainControllers -and $Script:CachedReachableDomainControllers.Count -gt 0) {
+        Write-Host ("Using cached reachable domain controller list from {0}: {1}" -f $Script:CachedReachableDomainControllersScanTime, ($Script:CachedReachableDomainControllers -join ', ')) -ForegroundColor DarkGray
+        return @($Script:CachedReachableDomainControllers)
+    }
+    $Script:CachedReachableDomainControllers = @(Get-TargetDomainControllers)
+    $Script:CachedReachableDomainControllersScanTime = Get-Date
+    return @($Script:CachedReachableDomainControllers)
+}
+# Runs (or re-runs) the reachability scan on demand, displays the resulting list, and caches it so later menu selections in this same script run skip the scan and reuse this list.
+function Show-ReachableDomainControllerScan {
+    $targets = @(Get-CachedTargetDomainControllers -ForceRescan)
+    Write-Host ''
+    Write-Host ("Cached {0} reachable domain controller(s) for the remainder of this script run." -f $targets.Count) -ForegroundColor Green
+    $targets | ForEach-Object { [pscustomobject]@{ DomainController = $_ } } | Format-Table -AutoSize
 }
 # Checks whether Success auditing is enabled for each required audit policy subcategory on each target computer.
 function Get-AuditPolicyStatus {
@@ -450,12 +471,13 @@ function Show-MainMenu {
     Write-Host '2. Check audit policy only'
     Write-Host '3. Run full audit with audit policy check'
     Write-Host '4. Run full audit and offer to enable missing audit policy'
-    Write-Host '5. Exit'
+    Write-Host '5. Scan for reachable domain controllers (caches result for this run)'
+    Write-Host '6. Exit'
 }
 # Runs only the audit policy validation workflow and exports the current audit policy status.
 function Show-AuditPolicyOnly {
     $script:OutputPath = Resolve-ReportFolder -Path $OutputPath
-    $targets = @(Get-TargetDomainControllers)
+    $targets = @(Get-CachedTargetDomainControllers)
     $auditStatus = @(Get-AuditPolicyStatus -ComputerName $targets)
     $auditStatus | Select-Object ComputerName, Subcategory, SuccessEnabled | Format-Table -AutoSize
     $script:AuditPolicyStatus = @($auditStatus)
@@ -468,7 +490,7 @@ function Invoke-FullAudit {
     $script:OutputPath = Resolve-ReportFolder -Path $OutputPath
     $script:AuditPolicyStatus = @()
     $script:AuditPolicyStatusAfterEnable = @()
-    $targets = @(Get-TargetDomainControllers)
+    $targets = @(Get-CachedTargetDomainControllers)
     if ($DoAuditPolicyCheck -or $DoOfferEnableAuditPolicy) {
         $auditStatus = @(Get-AuditPolicyStatus -ComputerName $targets)
         $script:AuditPolicyStatus = @($auditStatus)
@@ -511,17 +533,21 @@ if ($CheckAuditPolicy -or $OfferEnableAuditPolicy) {
     Invoke-FullAudit -DoAuditPolicyCheck:$CheckAuditPolicy -DoOfferEnableAuditPolicy:$OfferEnableAuditPolicy
 }
 else {
-    # Displays the menu once. Pressing Enter or selecting option 5 exits; all other valid selections run once and then the script terminates.
-Show-MainMenu
-$choice = Read-Host 'Select option (press Enter to exit)'
-if ([string]::IsNullOrWhiteSpace($choice)) { $choice = '5' }
-switch ($choice.Trim()) {
+# Repeats the menu after each selection so the reachable domain controller cache and audit policy status from earlier choices can be reused for later ones in the same run. Pressing Enter or selecting option 6 exits the loop and ends the script; options 1-5 run once and then redisplay the menu.
+$exitRequested = $false
+do {
+    Show-MainMenu
+    $choice = Read-Host 'Select option (press Enter to exit)'
+    if ([string]::IsNullOrWhiteSpace($choice)) { $choice = '6' }
+    switch ($choice.Trim()) {
     '1' { Invoke-FullAudit }
     '2' { Show-AuditPolicyOnly }
     '3' { Invoke-FullAudit -DoAuditPolicyCheck }
     '4' { Invoke-FullAudit -DoAuditPolicyCheck -DoOfferEnableAuditPolicy }
-    '5' { Write-Host 'Exiting.' -ForegroundColor Green }
-    default { Write-Host 'Invalid option. Run the script again and choose 1 through 5.' -ForegroundColor Yellow }
+    '5' { Show-ReachableDomainControllerScan }
+        '6' { Write-Host 'Exiting.' -ForegroundColor Green; $exitRequested = $true }
+    default { Write-Host 'Invalid option. Run the script again and choose 1 through 6.' -ForegroundColor Yellow }
 }
+} while (-not $exitRequested)
 }
 
